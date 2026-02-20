@@ -229,8 +229,18 @@ const EE_COUNTRIES = new Set([
 ]);
 
 const EE_COMPANY_NAMES = [
+  // Known EE/offshore-heavy consultancies
   'netcompany', 'epam', 'luxoft', 'softserve', 'intellias', 'ciklum', 'dataart',
   'eleks', 'devoteam', 'itransition', 'altkom', 'comarch', 'globallogic',
+  // Indian IT / offshore majors
+  'infosys', 'wipro', 'tcs', 'hcl', 'cognizant', 'mphasis', 'hexaware', 'virtusa',
+  'niit', 'zensar', 'persistent', 'mindtree', 'mastech', 'igate',
+  'l&t infotech', 'ltimindtree', 'tech mahindra',
+  // Eastern European / global SI
+  'atos', 'capgemini', 'sopra steria', 'cgi', 'gft', 'nnit', 'tietoevry',
+  'unison', 'rackspace', 'dxc', 'ntt', 'fujitsu', 'logica',
+  // Nordic outsourcers
+  'dfind', 'k-profile', 'itera', 'bouvet', 'bekk',
 ];
 
 const CITY_TO_COUNTRY: Record<string, string> = {

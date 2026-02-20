@@ -85,7 +85,10 @@
     tr.detail-row td { background: var(--surface-alt) !important; padding: 1rem 1.25rem; }
     .score-bar { display: flex; align-items: center; gap: 0.5rem; }
     .score-track { width: 52px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
-    .score-fill { height: 100%; background: var(--accent); border-radius: 2px; }
+    .score-fill { height: 100%; border-radius: 2px; }
+    .score-fill.s-high { background: var(--error); }
+    .score-fill.s-med  { background: var(--warning); }
+    .score-fill.s-low  { background: var(--success); }
 
     /* Badges */
     .badge { display: inline-flex; align-items: center; padding: 0.2rem 0.6rem; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; font-weight: 600; letter-spacing: 0.05em; white-space: nowrap; }
@@ -246,7 +249,7 @@
 
     <!-- Toolbar -->
     <div class="toolbar">
-      <input id="leads-search" class="search-input" type="text" placeholder="Search company or title…" oninput="renderLeads()" />
+      <input id="leads-search" class="search-input" type="text" placeholder="Search company, title, signal… (press /)" oninput="renderLeads()" aria-label="Search leads" />
       <div class="filter-btns">
         <button class="filter-btn active" id="f-all" onclick="setPriorityFilter('ALL', this)">ALL</button>
         <button class="filter-btn" id="f-high" onclick="setPriorityFilter('HIGH', this)">🔴 HIGH</button>
@@ -414,6 +417,48 @@
 </div>
 
 <script>
+  // ── Signal tooltips ────────────────────────────────────────────────────────
+  const SIGNAL_TIPS = {
+    'staffing_agency':       'Known staffing/recruitment agency — skip for outreach',
+    'agency_keyword':        'Company name contains recruitment agency keywords',
+    'multi_source':          'Active on 2+ job boards — strong hiring signal',
+    'multi_source_strong':   'Active on 3+ job boards — very strong hiring signal',
+    'role_diversity':        'Hiring across 3+ role categories — team expansion',
+    'recent':                'Posted within last 7 days',
+    'active':                'Posted within last 30 days',
+    'stale':                 'Posted 60+ days ago — may be filled',
+    'has_dev_team':          'Job description mentions dev team',
+  };
+
+  // ── Relative time helper ───────────────────────────────────────────────────
+  function relativeTime(iso) {
+    const diff = Date.now() - new Date(iso).getTime();
+    const m = Math.floor(diff / 60000);
+    const h = Math.floor(m / 60);
+    const d = Math.floor(h / 24);
+    if (m < 2)  return 'just now';
+    if (m < 60) return m + 'm ago';
+    if (h < 24) return h + 'h ago';
+    if (d < 7)  return d + 'd ago';
+    return new Date(iso).toLocaleDateString('da-DK');
+  }
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────────
+  document.addEventListener('keydown', function(e) {
+    // / → focus search
+    if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+      e.preventDefault();
+      const s = document.getElementById('leads-search');
+      if (s) { s.focus(); switchTab('leads', document.getElementById('tab-leads')); }
+    }
+    // r → refresh
+    if (e.key === 'r' && document.activeElement.tagName !== 'INPUT') {
+      loadAll();
+    }
+    // Escape → blur search
+    if (e.key === 'Escape') { document.activeElement.blur(); }
+  });
+
   // ── State ─────────────────────────────────────────────────────────────────
   let _leads = [];
   let _priorityFilter = 'ALL';
@@ -476,7 +521,7 @@
       return;
     }
     document.getElementById('last-run').textContent =
-      s.lastRun ? 'Last run: ' + new Date(s.lastRun).toLocaleString('da-DK') : 'No runs yet';
+      s.lastRun ? 'Last run: ' + relativeTime(s.lastRun) : 'No runs yet';
     document.getElementById('stats-grid').innerHTML =
       '<div class="stat-card accent"><div class="stat-value">' + s.totalLeads + '</div><div class="stat-label">Total Leads</div></div>' +
       '<div class="stat-card accent"><div class="stat-value">' + s.highLeads + '</div><div class="stat-label">HIGH Priority</div></div>' +
@@ -541,7 +586,21 @@
       const fillW = Math.round(l.priority_score || 0) + '%';
       const factors = (l.scoring_factors || '').split(',').map(f => f.trim()).filter(Boolean);
       const factorHtml = factors.length
-        ? factors.map(f => '<span class="badge badge-signal" style="margin:2px">' + esc(f) + '</span>').join('')
+        ? factors.map(function(f) {
+            const cls = f.includes('staffing') || f.includes('agency') ? 'badge-ee-high'
+              : f === 'multi_source_strong' ? 'badge-ee-low'
+              : f === 'multi_source' ? 'badge-ee-low'
+              : f === 'role_diversity' ? 'badge-ee-low'
+              : f === 'recent' ? 'badge-warm-intro'
+              : f === 'stale' ? 'badge-cold'
+              : f.startsWith('geo:') ? 'badge-source'
+              : f.startsWith('tech:') ? 'badge-signal'
+              : f.startsWith('seniority:') ? 'badge-warm'
+              : f.startsWith('funding:') ? 'badge-warm'
+              : 'badge-signal';
+            const tip = SIGNAL_TIPS[f] || f;
+            return '<span class="badge ' + cls + '" style="margin:2px" title="' + esc(tip) + '">' + esc(f) + '</span>';
+          }).join('')
         : '<span style="color:var(--text-muted);font-size:0.75rem">—</span>';
       const scraped = l.scraped_at ? new Date(l.scraped_at).toLocaleDateString('da-DK') : '—';
       const detailId = 'detail-' + l.id;
@@ -571,7 +630,7 @@
         '<tr class="lead-row" onclick="toggleDetail(\'' + detailId + '\',\'' + chevronId + '\')">' +
           '<td><span class="chevron" id="' + chevronId + '">&#9654;</span><strong>' + esc(l.company) + '</strong></td>' +
           '<td style="color:var(--text-sec)">' + esc(l.title) + '</td>' +
-          '<td><div class="score-bar"><div class="score-track"><div class="score-fill" style="width:' + fillW + '"></div></div><span class="mono" style="font-size:0.7rem;color:var(--text-muted)">' + (l.priority_score || 0) + '</span></div></td>' +
+          '<td><div class="score-bar"><div class="score-track"><div class="score-fill ' + (l.priority === 'HIGH' ? 's-high' : l.priority === 'MEDIUM' ? 's-med' : 's-low') + '" style="width:' + fillW + '"></div></div><span class="mono" style="font-size:0.7rem;color:var(--text-muted)">' + (l.priority_score || 0) + '</span></div></td>' +
           '<td>' + badge(l.priority || '—', pBadge) + '</td>' +
           '<td>' + badge(l.source || '—', 'badge-source') + '</td>' +
           '<td style="color:var(--text-muted);font-size:0.75rem">' + esc(l.location) + '</td>' +
@@ -683,6 +742,31 @@
   // ── Load all ──────────────────────────────────────────────────────────────
   async function loadAll() {
     await Promise.all([loadStats(), loadLeads(), loadCompanies(), loadDrafts(), loadTargets(), loadDuplicates()]);
+    updateIntelligenceStats();
+  }
+
+  function updateIntelligenceStats() {
+    if (!_leads.length) return;
+    const multiSource  = _leads.filter(l => (l.scoring_factors || '').includes('multi_source')).length;
+    const agencies     = _leads.filter(l => (l.scoring_factors || '').includes('staffing_agency') || (l.scoring_factors || '').includes('agency_keyword')).length;
+    const recent       = _leads.filter(l => (l.scoring_factors || '').includes('recent')).length;
+    const roleDiversity = _leads.filter(l => (l.scoring_factors || '').includes('role_diversity')).length;
+
+    // Append intelligence row to stats grid
+    let intelEl = document.getElementById('intel-stats');
+    if (!intelEl) {
+      intelEl = document.createElement('div');
+      intelEl.id = 'intel-stats';
+      intelEl.style.cssText = 'grid-column:1/-1;display:flex;gap:0.75rem;flex-wrap:wrap;padding:0.6rem 0.85rem;background:var(--surface-alt);border:1px solid var(--border);border-radius:10px;margin-top:0.25rem;align-items:center';
+      document.getElementById('stats-grid').after(intelEl);
+    }
+    intelEl.innerHTML =
+      '<span class="mono" style="font-size:0.65rem;color:var(--text-muted);margin-right:0.5rem">INTELLIGENCE:</span>' +
+      (multiSource  ? '<span class="badge badge-ee-low">📡 ' + multiSource + ' multi-source</span>' : '') +
+      (recent       ? '<span class="badge badge-warm-intro">⚡ ' + recent + ' recent</span>' : '') +
+      (roleDiversity? '<span class="badge badge-ee-low">🌱 ' + roleDiversity + ' role diversity</span>' : '') +
+      (agencies     ? '<span class="badge badge-ee-high">🚫 ' + agencies + ' agencies filtered</span>' : '') +
+      (!multiSource && !recent && !agencies ? '<span style="color:var(--text-muted);font-size:0.75rem">Run Phase 1 to see signals</span>' : '');
   }
 
   loadAll();

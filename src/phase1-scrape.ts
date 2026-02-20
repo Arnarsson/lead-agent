@@ -1,7 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { db, getAll } from './db';
-import { scoreLead, canonicalizeUrl, deduplicateJobs, sleep, normalizeCompany } from './utils';
+import { scoreLead, canonicalizeUrl, deduplicateJobs, sleep, normalizeCompany, normalizeCompanyName, enrichWithCompanySignals } from './utils';
 
 const BRIGHTDATA_KEY = process.env.BRIGHTDATA_API_KEY!;
 
@@ -213,8 +213,17 @@ export async function runPhase1(logFn: (msg: string) => void = console.log): Pro
     canonical_url: canonicalizeUrl(j.url || '', j.source),
   })).filter(j => j.canonical_url);
 
-  const unique = deduplicateJobs(normalized);
+  // Normalize company names before dedup (prevents "Bankdata A/S" vs "Bankdata" duplicates)
+  const normalizedCo = normalized.map(j => ({
+    ...j,
+    company: normalizeCompanyName(j.company) || j.company,
+  }));
+
+  const unique = deduplicateJobs(normalizedCo);
   logFn(`After dedup: ${unique.length} jobs`);
+
+  // Build company-level signals (multi-source boost, role diversity)
+  const companySignals = enrichWithCompanySignals(unique);
 
   const insert = db.prepare(`
     INSERT OR IGNORE INTO leads (canonical_url, company, title, location, source, priority, priority_score, scoring_factors, scraped_at)
@@ -223,7 +232,8 @@ export async function runPhase1(logFn: (msg: string) => void = console.log): Pro
 
   let inserted = 0;
   for (const job of unique.slice(0, CONFIG.max_jobs)) {
-    const { score, factors } = scoreLead(job);
+    const signals = companySignals.get(normalizeCompany(job.company)) || {};
+    const { score, factors } = scoreLead({ ...job, ...signals });
     const priority = score >= 70 ? 'HIGH' : score >= 40 ? 'MEDIUM' : 'LOW';
     insert.run(
       job.canonical_url, job.company, job.title, job.location, job.source,
