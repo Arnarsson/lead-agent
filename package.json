@@ -1,0 +1,29 @@
+{
+  "name": "lead-agent",
+  "version": "1.0.0",
+  "description": "Local lead generation pipeline - no n8n required",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "phase1": "tsx src/index.ts --phase 1",
+    "phase2": "tsx src/index.ts --phase 2",
+    "phase2b": "tsx src/index.ts --phase 3",
+    "phase3": "tsx src/index.ts --phase 4",
+    "cron": "tsx src/index.ts --cron",
+    "dashboard": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@types/express": "^5.0.6",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.1",
+    "express": "^5.2.1",
+    "node-cron": "^3.0.3",
+    "openai": "^4.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.11",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
