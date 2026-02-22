@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { db, getSnapshot, upsertSnapshot, upsertCompany, getAll, getOne } from './db';
+import { getIcpDb, getSnapshot, upsertSnapshot, upsertCompany, getAll, getOne } from './db';
 import { sleep, extractLinkedInCompanySlug, guessLinkedInCompanySlug, cleanText } from './utils';
 import type { RunFilters, LogFn } from './types';
 
@@ -40,9 +40,9 @@ async function downloadSnapshot(snapshotId: string): Promise<any[]> {
 
 // ── SERP → LinkedIn company URL ───────────────────────────────────────────────
 
-async function findLinkedInCompanyUrl(companyName: string): Promise<{ slug: string; url: string; confidence: string }> {
+async function findLinkedInCompanyUrl(d: ReturnType<typeof getIcpDb>, companyName: string): Promise<{ slug: string; url: string; confidence: string }> {
   const queryKey = `company:${companyName.toLowerCase()}`;
-  const cached = getSnapshot(queryKey);
+  const cached = getSnapshot(d, queryKey);
 
   if (cached?.status === 'ready' && cached.result_json) {
     const result = JSON.parse(cached.result_json);
@@ -55,7 +55,7 @@ async function findLinkedInCompanyUrl(companyName: string): Promise<{ slug: stri
   if (!snapshotId) {
     try {
       snapshotId = await triggerSerpSnapshot(keyword);
-      upsertSnapshot(queryKey, snapshotId, 'pending');
+      upsertSnapshot(d, queryKey, snapshotId, 'pending');
     } catch (err: any) {
       console.warn(`SERP trigger failed for ${companyName}: ${err.message}`);
       const slug = guessLinkedInCompanySlug(companyName);
@@ -86,7 +86,7 @@ async function findLinkedInCompanyUrl(companyName: string): Promise<{ slug: stri
   }
 
   const result = { slug, url: `https://www.linkedin.com/company/${slug}`, confidence };
-  upsertSnapshot(queryKey, snapshotId, 'ready', JSON.stringify(result));
+  upsertSnapshot(d, queryKey, snapshotId, 'ready', JSON.stringify(result));
   return result;
 }
 
@@ -348,6 +348,8 @@ async function findExec(companyName: string, role: 'CEO' | 'CTO', websiteUrl: st
 // ── Main phase 2 ──────────────────────────────────────────────────────────────
 
 export async function runPhase2(filters: RunFilters = {}, logFn: LogFn = console.log): Promise<void> {
+  const icp        = filters.icp        ?? 'source-angel';
+  const d          = getIcpDb(icp);
   const minScore   = filters.minScore   ?? 70;
   const priority   = filters.priority   ?? 'HIGH';
   const source     = filters.source     ?? 'ALL';
@@ -363,7 +365,7 @@ export async function runPhase2(filters: RunFilters = {}, logFn: LogFn = console
   if (source && source !== 'ALL') conditions.push(`source = '${source}'`);
   const whereClause = 'WHERE ' + conditions.join(' AND ');
 
-  const highLeads = getAll(`
+  const highLeads = getAll(d, `
     SELECT company, MAX(priority_score) as priority_score, COUNT(*) as lead_count,
            GROUP_CONCAT(DISTINCT canonical_url) as job_urls,
            GROUP_CONCAT(DISTINCT title) as job_titles,
@@ -382,20 +384,20 @@ export async function runPhase2(filters: RunFilters = {}, logFn: LogFn = console
 
     // Skip if already enriched recently (within 7 days)
     if (!forceRefresh) {
-      const existing = getOne(`
+      const existing = getOne(d, `
         SELECT enriched_at FROM companies WHERE company_name = ? AND enriched_at > datetime('now', '-7 days')
       `, companyName);
       if (existing) {
-        logFn(`  ⏭ Skipping ${companyName} (cached)`);
+        logFn(`  Skipping ${companyName} (cached)`);
         continue;
       }
     }
 
-    logFn(`  → Processing: ${companyName}`);
+    logFn(`  -> Processing: ${companyName}`);
 
     try {
       // Step 1: Find LinkedIn company URL
-      const { slug, url: linkedinUrl, confidence } = await findLinkedInCompanyUrl(companyName);
+      const { slug, url: linkedinUrl, confidence } = await findLinkedInCompanyUrl(d, companyName);
 
       // Step 2: Scrape LinkedIn company page
       let companyData: any = null;
@@ -446,7 +448,7 @@ export async function runPhase2(filters: RunFilters = {}, logFn: LogFn = console
       }
 
       // Save to companies table
-      upsertCompany({
+      upsertCompany(d, {
         company_name: companyName,
         linkedin_url: linkedinUrl,
         linkedin_slug: slug,
@@ -478,14 +480,14 @@ export async function runPhase2(filters: RunFilters = {}, logFn: LogFn = console
         enriched_at: new Date().toISOString(),
       });
 
-      logFn(`    ✓ ${companyName} — EE:${eeAssessment.ee_risk} signals:[${signals.join(',')}] temp:${temperature}`);
+      logFn(`    OK ${companyName} — EE:${eeAssessment.ee_risk} signals:[${signals.join(',')}] temp:${temperature}`);
       await sleep(1000);
     } catch (err: any) {
-      logFn(`    ✗ ${companyName}: ${err.message}`);
+      logFn(`    FAIL ${companyName}: ${err.message}`);
     }
   }
 
-  const stats = getAll(`SELECT hiring_temperature, COUNT(*) as c FROM companies GROUP BY hiring_temperature`);
+  const stats = getAll(d, `SELECT hiring_temperature, COUNT(*) as c FROM companies GROUP BY hiring_temperature`);
   logFn('Phase 2 done:');
   for (const s of stats) logFn(`  ${s.hiring_temperature || 'NONE'}: ${s.c} companies`);
 }

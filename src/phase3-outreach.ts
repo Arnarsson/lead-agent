@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { db, getAll, getOne } from './db';
+import { getIcpDb, getAll, getOne } from './db';
 import { sleep, cleanText } from './utils';
 import type { RunFilters, LogFn } from './types';
 
@@ -88,10 +88,14 @@ Respond with ONLY valid JSON in this exact format:
 }
 
 export async function runPhase3(filters: RunFilters = {}, logFn: LogFn = console.log): Promise<void> {
+  const icp           = filters.icp           ?? 'source-angel';
+  const d             = getIcpDb(icp);
   const temps         = (filters.temperature ?? 'HOT,WARM').split(',').map(s => s.trim()).filter(Boolean);
   const eeRisks       = (filters.eeRisk ?? 'LOW,MEDIUM').split(',').map(s => s.trim()).filter(Boolean);
   const limit         = filters.limit ?? 200;
   const forceRegen    = filters.forceRefresh ?? false;
+  const minEmployees  = filters.minEmployees ?? null;
+  const maxEmployees  = filters.maxEmployees ?? null;
 
   logFn(`=== Phase 3: Outreach draft generation ===`);
   logFn(`Filters: temperature=${temps.join(',')} eeRisk=${eeRisks.join(',')} limit=${limit} forceRegen=${forceRegen}`);
@@ -104,12 +108,17 @@ export async function runPhase3(filters: RunFilters = {}, logFn: LogFn = console
     ? ''
     : `AND c.hiring_temperature IN (${tempList})`;
 
-  const companies = getAll(`
+  const minEmpWhere = minEmployees ? `AND c.employees_count >= ${minEmployees}` : '';
+  const maxEmpWhere = maxEmployees ? `AND c.employees_count <= ${maxEmployees}` : '';
+
+  const companies = getAll(d, `
     SELECT c.*, t.target_name, t.target_linkedin_url, t.outreach_strategy
     FROM companies c
     LEFT JOIN targets t ON t.company_name = c.company_name
     WHERE c.ee_risk IN (${eeRiskList})
     ${tempWhere}
+    ${minEmpWhere}
+    ${maxEmpWhere}
     AND (c.hiring_signals IS NOT NULL AND c.hiring_signals != '[]')
     ORDER BY
       CASE c.hiring_temperature WHEN 'HOT' THEN 0 WHEN 'WARM' THEN 1 ELSE 2 END,
@@ -124,11 +133,11 @@ export async function runPhase3(filters: RunFilters = {}, logFn: LogFn = console
   for (const row of companies) {
     // Check if drafts already exist
     if (!forceRegen) {
-      const existing = getOne(`SELECT id FROM drafts WHERE company_name = ? AND target_name IS ?`, row.company_name, row.target_name || null);
+      const existing = getOne(d, `SELECT id FROM drafts WHERE company_name = ? AND target_name IS ?`, row.company_name, row.target_name || null);
       if (existing) continue;
     }
 
-    logFn(`  → ${row.company_name} / ${row.target_name || 'generic'}`);
+    logFn(`  -> ${row.company_name} / ${row.target_name || 'generic'}`);
 
     try {
       let hiringSignals: string[] = [];
@@ -153,7 +162,7 @@ export async function runPhase3(filters: RunFilters = {}, logFn: LogFn = console
         outreach_strategy: row.outreach_strategy || 'COLD_PERSONALIZED',
       });
 
-      const insertDraft = db.prepare(`
+      const insertDraft = d.prepare(`
         INSERT INTO drafts (company_name, target_name, target_linkedin_url, hiring_temperature,
           draft_index, angle_used, subject, body, cta, language)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -176,17 +185,17 @@ export async function runPhase3(filters: RunFilters = {}, logFn: LogFn = console
         totalDrafts++;
       }
 
-      logFn(`    ✓ ${result.drafts?.length ?? 0} drafts generated for ${row.company_name}`);
+      logFn(`    OK ${result.drafts?.length ?? 0} drafts generated for ${row.company_name}`);
       await sleep(500);
     } catch (err: any) {
-      logFn(`    ✗ ${row.company_name}: ${err.message}`);
+      logFn(`    FAIL ${row.company_name}: ${err.message}`);
     }
   }
 
   logFn(`Phase 3 done: ${totalDrafts} drafts generated`);
 
   // Export summary to JSON
-  const allDrafts = getAll(`
+  const allDrafts = getAll(d, `
     SELECT d.*, c.linkedin_url as company_linkedin_url, c.hiring_temperature,
            c.hiring_signal_snippets, c.outreach_angles
     FROM drafts d
@@ -194,8 +203,8 @@ export async function runPhase3(filters: RunFilters = {}, logFn: LogFn = console
     ORDER BY d.company_name, d.draft_index
   `);
 
-  const outputPath = `data/drafts-${new Date().toISOString().split('T')[0]}.json`;
-  const fs = await import('fs');
-  fs.writeFileSync(outputPath, JSON.stringify(allDrafts, null, 2));
+  const outputPath = `data/drafts-${icp}-${new Date().toISOString().split('T')[0]}.json`;
+  const fsModule = await import('fs');
+  fsModule.writeFileSync(outputPath, JSON.stringify(allDrafts, null, 2));
   console.log(`Exported ${allDrafts.length} drafts to ${outputPath}`);
 }

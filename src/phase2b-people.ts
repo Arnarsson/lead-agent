@@ -1,7 +1,6 @@
 import axios from 'axios';
 import fs from 'fs';
-import path from 'path';
-import { db, getSnapshot, upsertSnapshot, getAll, getOne } from './db';
+import { getIcpDb, getConnectionsPath, getSnapshot, upsertSnapshot, getAll, getOne } from './db';
 import { sleep, cleanText } from './utils';
 import type { RunFilters, LogFn } from './types';
 
@@ -13,14 +12,16 @@ interface Connection {
   lastName: string;
   company: string;
   linkedinUrl: string;
+  position: string;
+  connectedOn: string;
 }
 
 // ── Load connections from CSV ─────────────────────────────────────────────────
 
-function loadConnections(): Connection[] {
-  const csvPath = path.join(process.cwd(), 'data', 'connections.csv');
+function loadConnections(slug: string): Connection[] {
+  const csvPath = getConnectionsPath(slug);
   if (!fs.existsSync(csvPath)) {
-    console.warn('  No connections.csv found at data/connections.csv — skipping connection matching');
+    console.warn(`  No connections CSV found at ${csvPath} — skipping connection matching`);
     console.warn('  Export from LinkedIn: Settings → Data privacy → Get a copy of your data → Connections');
     return [];
   }
@@ -38,6 +39,8 @@ function loadConnections(): Connection[] {
   const lastNameIdx = headers.findIndex(h => h.includes('last name'));
   const companyIdx = headers.findIndex(h => h.includes('company'));
   const urlIdx = headers.findIndex(h => h.includes('url') || h.includes('profile'));
+  const positionIdx = headers.findIndex(h => h.includes('position'));
+  const connectedOnIdx = headers.findIndex(h => h.includes('connected'));
 
   for (const line of lines.slice(headerIdx + 1)) {
     const cols = line.split(',').map(c => c.replace(/"/g, '').trim());
@@ -46,7 +49,7 @@ function loadConnections(): Connection[] {
     const company = cols[companyIdx] || '';
     const url = cols[urlIdx] || '';
     if (firstName || lastName) {
-      connections.push({ firstName, lastName, company, linkedinUrl: url });
+      connections.push({ firstName, lastName, company, linkedinUrl: url, position: cols[positionIdx] || '', connectedOn: cols[connectedOnIdx] || '' });
     }
   }
 
@@ -171,9 +174,9 @@ function extractPersonLinkedInUrl(organic: any[], originalName: string, companyN
   return { url: `https://www.linkedin.com/in/${guessedSlug}`, slug: guessedSlug, confidence: 'GUESSED' };
 }
 
-async function findPersonLinkedInUrl(name: string, companyName: string): Promise<{ url: string; slug: string; confidence: string }> {
+async function findPersonLinkedInUrl(d: ReturnType<typeof getIcpDb>, name: string, companyName: string): Promise<{ url: string; slug: string; confidence: string }> {
   const queryKey = `person:${name.toLowerCase()}:${companyName.toLowerCase()}`;
-  const cached = getSnapshot(queryKey);
+  const cached = getSnapshot(d, queryKey);
 
   if (cached?.status === 'ready' && cached.result_json) {
     return JSON.parse(cached.result_json);
@@ -183,7 +186,7 @@ async function findPersonLinkedInUrl(name: string, companyName: string): Promise
 
   try {
     const snapshotId = await triggerPersonSerpSnapshot(keyword);
-    upsertSnapshot(queryKey, snapshotId, 'pending');
+    upsertSnapshot(d, queryKey, snapshotId, 'pending');
 
     const ready = await pollReady(snapshotId);
     if (!ready) throw new Error('Snapshot timed out');
@@ -192,7 +195,7 @@ async function findPersonLinkedInUrl(name: string, companyName: string): Promise
     const organic = results[0]?.organic || [];
     const result = extractPersonLinkedInUrl(organic, name, companyName);
 
-    upsertSnapshot(queryKey, snapshotId, 'ready', JSON.stringify(result));
+    upsertSnapshot(d, queryKey, snapshotId, 'ready', JSON.stringify(result));
     return result;
   } catch (err: any) {
     const guessedSlug = name.toLowerCase().trim().replace(/\s+/g, '-');
@@ -238,6 +241,8 @@ async function extractWorkHistory(name: string, company: string, linkedinUrl: st
 // ── Main phase 2B ─────────────────────────────────────────────────────────────
 
 export async function runPhase2b(filters: RunFilters = {}, logFn: LogFn = console.log): Promise<void> {
+  const icp       = filters.icp       ?? 'source-angel';
+  const d         = getIcpDb(icp);
   const eeRisks   = (filters.eeRisk ?? 'LOW,MEDIUM').split(',').map(s => s.trim()).filter(Boolean);
   const limit     = filters.limit ?? 100;
   const forceRefresh = filters.forceRefresh ?? false;
@@ -245,12 +250,12 @@ export async function runPhase2b(filters: RunFilters = {}, logFn: LogFn = consol
   logFn(`=== Phase 2B: People mapping ===`);
   logFn(`Filters: eeRisk=${eeRisks.join(',')} limit=${limit}`);
 
-  const connections = loadConnections();
+  const connections = loadConnections(icp);
   logFn(`Loaded ${connections.length} connections`);
 
   const eeRiskList = eeRisks.map(r => `'${r}'`).join(',');
 
-  const companies = getAll(`
+  const companies = getAll(d, `
     SELECT * FROM companies
     WHERE ee_risk IN (${eeRiskList})
     AND (ceo_name IS NOT NULL OR cto_name IS NOT NULL)
@@ -260,10 +265,11 @@ export async function runPhase2b(filters: RunFilters = {}, logFn: LogFn = consol
 
   logFn(`Processing ${companies.length} companies for people mapping`);
 
-  const insertTarget = db.prepare(`
+  const insertTarget = d.prepare(`
     INSERT INTO targets (company_name, target_name, target_role, target_title, target_linkedin_url,
-      connection_found, connection_type, connection_score, outreach_strategy, all_companies, search_query)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      connection_found, connection_type, connection_score, outreach_strategy, all_companies, search_query,
+      bridge_name, bridge_position, bridge_linkedin_url, bridge_connected_on)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   for (const company of companies) {
@@ -276,15 +282,15 @@ export async function runPhase2b(filters: RunFilters = {}, logFn: LogFn = consol
     for (const target of targets) {
       // Check if already processed
       if (!forceRefresh) {
-        const existing = getOne('SELECT id FROM targets WHERE company_name = ? AND target_name = ?', company.company_name, target.name);
+        const existing = getOne(d, 'SELECT id FROM targets WHERE company_name = ? AND target_name = ?', company.company_name, target.name);
         if (existing) continue;
       }
 
-      logFn(`  → ${company.company_name} / ${target.name} (${target.role})`);
+      logFn(`  -> ${company.company_name} / ${target.name} (${target.role})`);
 
       try {
         // Find personal LinkedIn URL
-        const { url: linkedinUrl, confidence } = await findPersonLinkedInUrl(target.name, company.company_name);
+        const { url: linkedinUrl, confidence } = await findPersonLinkedInUrl(d, target.name, company.company_name);
 
         // Extract work history via Firecrawl
         const { allCompanies } = await extractWorkHistory(target.name, company.company_name, linkedinUrl);
@@ -296,6 +302,9 @@ export async function runPhase2b(filters: RunFilters = {}, logFn: LogFn = consol
           : match.score >= 70 ? 'WARM_REFERENCE'
           : 'COLD_PERSONALIZED';
 
+        const bridge = match.matchedRow;
+        const bridgeName = bridge ? `${bridge.firstName} ${bridge.lastName}`.trim() : null;
+        // For DIRECT match, bridge IS the target — for COMPANY_COLLEAGUE, bridge is the intermediate person
         insertTarget.run(
           company.company_name,
           target.name,
@@ -308,17 +317,21 @@ export async function runPhase2b(filters: RunFilters = {}, logFn: LogFn = consol
           outreachStrategy,
           JSON.stringify(allCompanies),
           `site:linkedin.com/in "${target.name}" "${company.company_name}"`,
+          bridgeName,
+          bridge?.position || null,
+          bridge?.linkedinUrl || null,
+          bridge?.connectedOn || null,
         );
 
-        logFn(`    ✓ ${match.type} (score:${match.score}) → ${outreachStrategy}`);
+        logFn(`    OK ${match.type} (score:${match.score}) -> ${outreachStrategy}`);
         await sleep(1000);
       } catch (err: any) {
-        logFn(`    ✗ ${target.name}: ${err.message}`);
+        logFn(`    FAIL ${target.name}: ${err.message}`);
       }
     }
   }
 
-  const total = getOne('SELECT COUNT(*) as c FROM targets') as any;
-  const warm  = getOne("SELECT COUNT(*) as c FROM targets WHERE connection_found = 1") as any;
+  const total = getOne(d, 'SELECT COUNT(*) as c FROM targets') as any;
+  const warm  = getOne(d, "SELECT COUNT(*) as c FROM targets WHERE connection_found = 1") as any;
   logFn(`Phase 2B done: ${total?.c ?? 0} targets mapped (${warm?.c ?? 0} with connections)`);
 }

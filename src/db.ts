@@ -5,10 +5,66 @@ import fs from 'fs';
 const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-export const db = new DatabaseSync(path.join(DATA_DIR, 'leads.db'));
+// ── ICP registry ──────────────────────────────────────────────────────────────
 
-export function initDb() {
-  db.exec(`
+export interface ICP {
+  slug: string;
+  name: string;
+  description?: string;
+  keywords?: string[];
+  target_filters?: {
+    min_employees?: number | null;
+    max_employees?: number | null;
+    min_score?: number;
+    ee_risk?: string;
+    temperature?: string;
+    limit?: number;
+  };
+  created_at: string;
+}
+
+const ICPS_PATH = path.join(DATA_DIR, 'icps.json');
+
+export function listIcps(): ICP[] {
+  if (!fs.existsSync(ICPS_PATH)) return [];
+  return JSON.parse(fs.readFileSync(ICPS_PATH, 'utf-8'));
+}
+
+export function saveIcps(icps: ICP[]) {
+  fs.writeFileSync(ICPS_PATH, JSON.stringify(icps, null, 2));
+}
+
+export function createIcp(icp: Omit<ICP, 'created_at'>): ICP {
+  const icps = listIcps();
+  if (icps.find(i => i.slug === icp.slug)) throw new Error(`ICP '${icp.slug}' already exists`);
+  const newIcp: ICP = { ...icp, created_at: new Date().toISOString().slice(0, 10) };
+  icps.push(newIcp);
+  saveIcps(icps);
+  return newIcp;
+}
+
+// ── Per-ICP DB factory ────────────────────────────────────────────────────────
+
+const _dbCache = new Map<string, DatabaseSync>();
+
+export function getIcpDb(slug: string): DatabaseSync {
+  if (!_dbCache.has(slug)) {
+    const dbPath = path.join(DATA_DIR, `${slug}.db`);
+    _dbCache.set(slug, new DatabaseSync(dbPath));
+  }
+  return _dbCache.get(slug)!;
+}
+
+export function getConnectionsPath(slug: string): string {
+  return path.join(DATA_DIR, `${slug}-connections.csv`);
+}
+
+// Keep legacy export for backward compat during transition
+export const db = getIcpDb('source-angel');
+
+export function initDb(slug = 'source-angel') {
+  const d = getIcpDb(slug);
+  d.exec(`
     CREATE TABLE IF NOT EXISTS leads (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       canonical_url TEXT UNIQUE,
@@ -83,6 +139,10 @@ export function initDb() {
       outreach_strategy TEXT,
       all_companies TEXT,
       search_query TEXT,
+      bridge_name TEXT,
+      bridge_position TEXT,
+      bridge_linkedin_url TEXT,
+      bridge_connected_on TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -101,31 +161,39 @@ export function initDb() {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
-  console.log('Database initialized');
+  // Migrate existing targets table
+  for (const col of [
+    'bridge_name TEXT',
+    'bridge_position TEXT',
+    'bridge_linkedin_url TEXT',
+    'bridge_connected_on TEXT',
+  ]) {
+    try { d.exec(`ALTER TABLE targets ADD COLUMN ${col}`); } catch {}
+  }
+
+  console.log(`Database initialized [${slug}]`);
 }
 
-// ── Query helpers ─────────────────────────────────────────────────────────────
+// ── Query helpers (take explicit db) ─────────────────────────────────────────
 
-export function getOne<T = any>(sql: string, ...params: any[]): T | undefined {
-  return db.prepare(sql).get(...params) as T | undefined;
+export function getOne<T = any>(d: DatabaseSync, sql: string, ...params: any[]): T | undefined {
+  return d.prepare(sql).get(...params) as T | undefined;
 }
 
-export function getAll<T = any>(sql: string, ...params: any[]): T[] {
-  return db.prepare(sql).all(...params) as T[];
+export function getAll<T = any>(d: DatabaseSync, sql: string, ...params: any[]): T[] {
+  return d.prepare(sql).all(...params) as T[];
 }
 
-export function run(sql: string, ...params: any[]): void {
-  db.prepare(sql).run(...params);
+export function run(d: DatabaseSync, sql: string, ...params: any[]): void {
+  d.prepare(sql).run(...params);
 }
 
-// ── Snapshot helpers ──────────────────────────────────────────────────────────
-
-export function getSnapshot(queryKey: string): any {
-  return getOne('SELECT * FROM snapshots WHERE query_key = ?', queryKey);
+export function getSnapshot(d: DatabaseSync, queryKey: string): any {
+  return getOne(d, 'SELECT * FROM snapshots WHERE query_key = ?', queryKey);
 }
 
-export function upsertSnapshot(queryKey: string, snapshotId: string, status: string, resultJson?: string) {
-  db.exec(`
+export function upsertSnapshot(d: DatabaseSync, queryKey: string, snapshotId: string, status: string, resultJson?: string) {
+  d.exec(`
     INSERT INTO snapshots (query_key, snapshot_id, status, result_json, updated_at)
     VALUES ('${queryKey.replace(/'/g, "''")}', '${snapshotId}', '${status}', ${resultJson ? `'${resultJson.replace(/'/g, "''")}'` : 'NULL'}, datetime('now'))
     ON CONFLICT(query_key) DO UPDATE SET
@@ -136,24 +204,16 @@ export function upsertSnapshot(queryKey: string, snapshotId: string, status: str
   `);
 }
 
-// ── Company helpers ───────────────────────────────────────────────────────────
-
-export function getCompany(companyName: string): any {
-  return getOne('SELECT * FROM companies WHERE company_name = ?', companyName);
-}
-
-export function upsertCompany(data: Record<string, any>) {
+export function upsertCompany(d: DatabaseSync, data: Record<string, any>) {
   const sanitized: Record<string, any> = {};
   for (const [k, v] of Object.entries(data)) {
     sanitized[k] = v === undefined ? null : v;
   }
-
   const cols = Object.keys(sanitized);
   const placeholders = cols.map(() => '?').join(', ');
   const updates = cols.filter(k => k !== 'company_name').map(k => `${k} = excluded.${k}`).join(', ');
   const values = cols.map(k => sanitized[k]);
-
-  db.prepare(`
+  d.prepare(`
     INSERT INTO companies (${cols.join(', ')}) VALUES (${placeholders})
     ON CONFLICT(company_name) DO UPDATE SET ${updates}
   `).run(...values);

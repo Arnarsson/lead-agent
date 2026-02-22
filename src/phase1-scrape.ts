@@ -1,7 +1,8 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { db, getAll } from './db';
+import { getIcpDb, initDb, getAll, listIcps } from './db';
 import { scoreLead, canonicalizeUrl, deduplicateJobs, sleep, normalizeCompany, normalizeCompanyName, enrichWithCompanySignals } from './utils';
+import type { RunFilters, LogFn } from './types';
 
 const BRIGHTDATA_KEY = process.env.BRIGHTDATA_API_KEY!;
 
@@ -83,10 +84,12 @@ async function scrapeTheHub(): Promise<RawJob[]> {
   return jobs;
 }
 
-async function scrapeLinkedIn(): Promise<RawJob[]> {
+async function scrapeLinkedIn(keywords: string[]): Promise<RawJob[]> {
+  const kw = keywords.length ? encodeURIComponent(keywords[0]) : 'software%20developer';
   const jobs: RawJob[] = [];
   try {
-    const html = await scrapeViaBrightData(CONFIG.linkedin_search_url);
+    const url = `https://www.linkedin.com/jobs/search/?keywords=${kw}&location=Denmark&f_TPR=r2592000`;
+    const html = await scrapeViaBrightData(url);
     const $ = cheerio.load(html);
 
     const titles: string[] = [];
@@ -117,11 +120,12 @@ async function scrapeLinkedIn(): Promise<RawJob[]> {
   return jobs;
 }
 
-async function scrapeItJobbank(): Promise<RawJob[]> {
+async function scrapeItJobbank(keywords: string[]): Promise<RawJob[]> {
+  const q = keywords.length ? keywords.join(' OR ') : '';
   const jobs: RawJob[] = [];
   try {
     const res = await axios.get(CONFIG.itjobbank_url, {
-      params: { q: '', page: 1, sort: 'score', jobage: 30 },
+      params: { q, page: 1, sort: 'score', jobage: 30 },
       timeout: 30000,
     });
     const results = res.data?.results || [];
@@ -150,12 +154,13 @@ async function scrapeItJobbank(): Promise<RawJob[]> {
   return jobs;
 }
 
-async function scrapeJobindex(): Promise<RawJob[]> {
+async function scrapeJobindex(keywords: string[]): Promise<RawJob[]> {
+  const q = keywords.length ? keywords.join(' OR ') : 'developer';
   const jobs: RawJob[] = [];
   try {
     const res = await axios.get(CONFIG.jobindex_url, {
       params: {
-        q: 'developer', page: 1, sort: 'score', jobage: 30,
+        q, page: 1, sort: 'score', jobage: 30,
         employment_place: [3, 2, 4],
         employment_type: [1, 11, 2],
         workinghours_type: [1, 2],
@@ -189,14 +194,22 @@ async function scrapeJobindex(): Promise<RawJob[]> {
   return jobs;
 }
 
-export async function runPhase1(logFn: (msg: string) => void = console.log): Promise<void> {
+export async function runPhase1(filters: RunFilters = {}, logFn: LogFn = console.log): Promise<void> {
+  const icp = filters.icp ?? 'source-angel';
+  const d = getIcpDb(icp);
+  initDb(icp);
+
   logFn('=== Phase 1: Scraping job boards ===');
+
+  const icpConfig = listIcps().find(i => i.slug === icp);
+  const keywords: string[] = icpConfig?.keywords ?? [];
+  logFn(`Keywords: ${keywords.length ? keywords.join(', ') : '(default — all jobs)'}`);
 
   const [thehub, linkedin, itjobbank, jobindex] = await Promise.all([
     scrapeTheHub(),
-    scrapeLinkedIn(),
-    scrapeItJobbank(),
-    scrapeJobindex(),
+    scrapeLinkedIn(keywords),
+    scrapeItJobbank(keywords),
+    scrapeJobindex(keywords),
   ]);
 
   const all: RawJob[] = [...thehub, ...linkedin, ...itjobbank, ...jobindex];
@@ -225,7 +238,7 @@ export async function runPhase1(logFn: (msg: string) => void = console.log): Pro
   // Build company-level signals (multi-source boost, role diversity)
   const companySignals = enrichWithCompanySignals(unique);
 
-  const insert = db.prepare(`
+  const insert = d.prepare(`
     INSERT OR IGNORE INTO leads (canonical_url, company, title, location, source, priority, priority_score, scoring_factors, scraped_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -242,9 +255,9 @@ export async function runPhase1(logFn: (msg: string) => void = console.log): Pro
     inserted++;
   }
 
-  const total = db.prepare('SELECT COUNT(*) as c FROM leads').get() as any;
+  const total = d.prepare('SELECT COUNT(*) as c FROM leads').get() as any;
   logFn(`Phase 1 done: ${inserted} new leads inserted (${total?.c ?? 0} total)`);
 
-  const stats = getAll('SELECT priority, COUNT(*) as c FROM leads GROUP BY priority');
+  const stats = getAll(d, 'SELECT priority, COUNT(*) as c FROM leads GROUP BY priority');
   for (const s of stats) logFn(`  ${s.priority}: ${s.c}`);
 }
