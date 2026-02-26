@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import basicAuth from 'express-basic-auth';
 import path from 'path';
 import fs from 'fs';
 import { getIcpDb, listIcps, saveIcps, createIcp, initDb } from './db';
@@ -9,6 +10,13 @@ const app = express();
 const PORT = process.env.DASHBOARD_PORT || 4242;
 
 app.use(express.json());
+
+if (process.env.DASHBOARD_USER && process.env.DASHBOARD_PASS) {
+  app.use(basicAuth({
+    users: { [process.env.DASHBOARD_USER]: process.env.DASHBOARD_PASS },
+    challenge: true,
+  }));
+}
 
 // ── ICP helpers ───────────────────────────────────────────────────────────────
 
@@ -21,6 +29,225 @@ function getDb(slug = 'source-angel') {
 function icpSlug(req: express.Request): string {
   return (req.query.icp as string) || (req.body?.icp as string) || 'source-angel';
 }
+
+// ── Local system settings (Phase 1 UI/API only; no runtime wiring yet) ──────
+
+const SETTINGS_FILE = process.env.SETTINGS_FILE || path.join(process.cwd(), '.settings.local.json');
+const SETTINGS_UI_ENABLED = process.env.SETTINGS_UI === '1';
+const SETTINGS_KEYS = [
+  'OPENROUTER_API_KEY',
+  'OPENROUTER_MODEL',
+  'FIRECRAWL_API_KEY',
+  'FIRECRAWL_BASE_URL',
+  'BRIGHTDATA_API_KEY',
+] as const;
+type SettingsKey = typeof SETTINGS_KEYS[number];
+type SettingsMap = Partial<Record<SettingsKey, string>>;
+const SECRET_SETTINGS_KEYS = new Set<SettingsKey>([
+  'OPENROUTER_API_KEY',
+  'FIRECRAWL_API_KEY',
+  'BRIGHTDATA_API_KEY',
+]);
+
+function isSettingsKey(v: string): v is SettingsKey {
+  return (SETTINGS_KEYS as readonly string[]).includes(v);
+}
+
+function readLocalSettings(): SettingsMap {
+  if (!fs.existsSync(SETTINGS_FILE)) return {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    const out: SettingsMap = {};
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (!isSettingsKey(k) || typeof v !== 'string') continue;
+      out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeLocalSettings(settings: SettingsMap) {
+  const cleaned: SettingsMap = {};
+  for (const key of SETTINGS_KEYS) {
+    const value = settings[key];
+    if (typeof value === 'string' && value.trim() !== '') cleaned[key] = value.trim();
+  }
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(cleaned, null, 2) + '\n', 'utf8');
+}
+
+function maskSecret(value?: string): string {
+  if (!value) return '';
+  if (value.length <= 8) return '*'.repeat(value.length);
+  return `${value.slice(0, 4)}${'*'.repeat(Math.max(4, value.length - 8))}${value.slice(-4)}`;
+}
+
+function maskSettings(settings: SettingsMap) {
+  const out: Record<SettingsKey, { value: string; isSet: boolean; masked: boolean }> = {} as any;
+  for (const key of SETTINGS_KEYS) {
+    const value = settings[key] ?? '';
+    out[key] = {
+      value: SECRET_SETTINGS_KEYS.has(key) ? maskSecret(value) : value,
+      isSet: Boolean(value),
+      masked: SECRET_SETTINGS_KEYS.has(key),
+    };
+  }
+  return out;
+}
+
+function settingsApiResponse(settings: SettingsMap) {
+  return {
+    settings: maskSettings(settings),
+    featureFlags: { settingsUiEnabled: SETTINGS_UI_ENABLED },
+    storage: { file: path.basename(SETTINGS_FILE) },
+  };
+}
+
+function applySettingsPatch(existing: SettingsMap, payload: any): SettingsMap {
+  const patch = payload?.settings && typeof payload.settings === 'object' ? payload.settings : payload;
+  const next: SettingsMap = { ...existing };
+  for (const key of SETTINGS_KEYS) {
+    if (!(key in (patch || {}))) continue;
+    const raw = patch[key];
+    if (raw == null) {
+      delete next[key];
+      continue;
+    }
+    if (typeof raw !== 'string') continue;
+    const val = raw.trim();
+    if (val === '') {
+      delete next[key];
+      continue;
+    }
+    next[key] = val;
+  }
+  return next;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readResponseSnippet(res: Response): Promise<string> {
+  try {
+    const text = await res.text();
+    return text.slice(0, 300).replace(/\s+/g, ' ').trim();
+  } catch {
+    return '';
+  }
+}
+
+async function testOpenRouter(settings: SettingsMap, timeoutMs: number) {
+  const apiKey = settings.OPENROUTER_API_KEY;
+  const model = settings.OPENROUTER_MODEL;
+  if (!apiKey) return { ok: false, error: 'OPENROUTER_API_KEY not set' };
+  if (!model) return { ok: false, error: 'OPENROUTER_MODEL not set' };
+  const started = Date.now();
+  try {
+    const res = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'Ping. Reply with one word.' }],
+        max_tokens: 1,
+        temperature: 0,
+      }),
+    }, timeoutMs);
+    const latencyMs = Date.now() - started;
+    if (!res.ok) {
+      const snippet = await readResponseSnippet(res);
+      return { ok: false, status: res.status, latencyMs, error: snippet || `HTTP ${res.status}` };
+    }
+    return { ok: true, status: res.status, latencyMs };
+  } catch (err: any) {
+    return { ok: false, latencyMs: Date.now() - started, error: err?.name === 'AbortError' ? 'Timeout' : (err?.message || 'Request failed') };
+  }
+}
+
+async function testFirecrawl(settings: SettingsMap, timeoutMs: number) {
+  const apiKey = settings.FIRECRAWL_API_KEY;
+  const baseUrl = (settings.FIRECRAWL_BASE_URL || 'https://api.firecrawl.dev').replace(/\/+$/, '');
+  if (!apiKey) return { ok: false, error: 'FIRECRAWL_API_KEY not set' };
+  const started = Date.now();
+  try {
+    const res = await fetchWithTimeout(`${baseUrl}/v1/scrape`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        url: 'https://example.com',
+        formats: ['markdown'],
+      }),
+    }, timeoutMs);
+    const latencyMs = Date.now() - started;
+    if (!res.ok) {
+      const snippet = await readResponseSnippet(res);
+      return { ok: false, status: res.status, latencyMs, error: snippet || `HTTP ${res.status}` };
+    }
+    return { ok: true, status: res.status, latencyMs, baseUrl };
+  } catch (err: any) {
+    return { ok: false, latencyMs: Date.now() - started, error: err?.name === 'AbortError' ? 'Timeout' : (err?.message || 'Request failed'), baseUrl };
+  }
+}
+
+// ── System settings API ──────────────────────────────────────────────────────
+
+app.get('/api/system/settings', (_req, res) => {
+  try {
+    res.json(settingsApiResponse(readLocalSettings()));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/system/settings', (req, res) => {
+  try {
+    const current = readLocalSettings();
+    const next = applySettingsPatch(current, req.body);
+    writeLocalSettings(next);
+    res.json({ ok: true, ...settingsApiResponse(next) });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/system/settings/test', async (req, res) => {
+  try {
+    const timeoutMsRaw = Number(req.body?.timeoutMs);
+    const timeoutMs = Number.isFinite(timeoutMsRaw) ? Math.max(1000, Math.min(30000, timeoutMsRaw)) : 10000;
+    const stored = readLocalSettings();
+    const effective = applySettingsPatch(stored, req.body);
+
+    const [openrouter, firecrawl] = await Promise.all([
+      testOpenRouter(effective, timeoutMs),
+      testFirecrawl(effective, timeoutMs),
+    ]);
+    const brightdata = effective.BRIGHTDATA_API_KEY
+      ? { ok: true, mode: 'presence-only' as const }
+      : { ok: false, mode: 'presence-only' as const, error: 'BRIGHTDATA_API_KEY not set' };
+
+    res.json({
+      ok: Boolean(openrouter.ok && firecrawl.ok && brightdata.ok),
+      timeoutMs,
+      providers: { openrouter, firecrawl, brightdata },
+    });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // ── ICP API ───────────────────────────────────────────────────────────────────
 
