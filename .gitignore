@@ -1,0 +1,9 @@
+node_modules/
+data/*.db
+data/*.csv
+.env
+.settings.local.json
+*.zip
+*.zip.zip
+dashboard/
+dashboard-after-phase2/
